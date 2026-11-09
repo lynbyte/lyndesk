@@ -27,6 +27,11 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Periodic keyframe interval for clients that never ack video.
+const UNACKED_KEYFRAME_INTERVAL: Duration = Duration::from_secs(2);
+/// Safety-net keyframe interval once the client acks (it requests the rest).
+const ACKED_KEYFRAME_INTERVAL: Duration = Duration::from_secs(30);
+
 fn instant_ago(duration: Duration) -> Instant {
     let now = Instant::now();
     now.checked_sub(duration).unwrap_or(now)
@@ -87,6 +92,8 @@ pub enum InboundEvent {
     EnableCursorShape(bool),
     /// Client asks for a keyframe on the next encode (e.g. tab regained focus).
     RequestKeyframe,
+    /// Client decoded and painted every video frame up to this sequence.
+    VideoAck(u64),
     Disconnected,
 }
 
@@ -166,6 +173,9 @@ pub fn spawn_receive_thread(
                     send_or_break!(InboundEvent::EnableCursorShape(enabled))
                 }
                 Ok(Message::RequestKeyframe) => send_or_break!(InboundEvent::RequestKeyframe),
+                Ok(Message::VideoAck { sequence }) => {
+                    send_or_break!(InboundEvent::VideoAck(sequence))
+                }
                 Ok(_) => {}
                 Err(_) => {
                     let _ = tx.send(InboundEvent::Disconnected);
@@ -423,6 +433,12 @@ pub struct SessionRunner {
     pub mouse_buttons_down: u8,
     pub frame_interval: Duration,
     pub last_keyframe_time: Instant,
+    /// A keyframe was explicitly asked for (client request, resume, flow
+    /// stall), as opposed to the periodic one. Explicit keyframes bypass the
+    /// flow-control window: the client cannot recover without them.
+    pub keyframe_forced: bool,
+    /// Ack-based video flow control (active once the client acks frames).
+    pub flow: crate::flow::FlowControl,
     /// Last time we sent a Ping (for RTT measurement).
     pub ping_sent_at: Option<Instant>,
     /// Smoothed round-trip time (exponential moving average).
@@ -538,6 +554,8 @@ impl SessionRunner {
             mouse_buttons_down: 0,
             frame_interval,
             last_keyframe_time: instant_ago(Duration::from_secs(10)),
+            keyframe_forced: false,
+            flow: crate::flow::FlowControl::new(),
             ping_sent_at: None,
             rtt_us: None,
             jitter_us: None,
@@ -581,8 +599,8 @@ impl SessionRunner {
                 height,
                 "session resumed"
             );
-            // Force keyframe on first frame (reset last_keyframe_time to epoch)
-            runner.last_keyframe_time = instant_ago(Duration::from_secs(3600));
+            // Force keyframe on first frame.
+            runner.force_keyframe_next();
         } else {
             runner.sender.send_msg(&Message::Hello {
                 width,
@@ -797,10 +815,11 @@ impl SessionRunner {
                         tracing::info!(last_sequence, "client resume accepted, forcing keyframe");
                         // Send ResumeOk so client knows it can reuse its decoder
                         let _ = self.sender.send_msg(&Message::ResumeOk);
-                        // Force keyframe by resetting the timer
-                        self.last_keyframe_time = instant_ago(Duration::from_secs(3600));
-                        // Reset sequence to sync with client
+                        self.force_keyframe_next();
+                        // Reset sequence to sync with client; acks for the
+                        // old numbering no longer apply.
                         self.sequence = last_sequence;
+                        self.flow.reset_window();
                     } else {
                         tracing::warn!("client sent Resume with invalid token");
                     }
@@ -830,11 +849,17 @@ impl SessionRunner {
                 }
                 InboundEvent::RequestKeyframe => {
                     let _ = self.sender.send_msg(&Message::KeyframeFence);
-                    // Force `needs_keyframe()` to return true on the next tick.
-                    // Pipeline::tick honors it via `ctx.needs_keyframe` and
-                    // calls force_keyframe() on the encoder.
-                    self.last_keyframe_time = instant_ago(Duration::from_secs(3600));
+                    self.force_keyframe_next();
                     tracing::debug!("client requested keyframe");
+                }
+                InboundEvent::VideoAck(sequence) => {
+                    if !self.flow.is_active() {
+                        tracing::info!(
+                            session_id = %self.session_id,
+                            "client acks video frames: ack-based flow control on"
+                        );
+                    }
+                    self.flow.on_ack(sequence);
                 }
                 InboundEvent::Disconnected => {
                     anyhow::bail!("client disconnected");
@@ -925,8 +950,10 @@ impl SessionRunner {
     ) -> Result<()> {
         if encoded.is_keyframe {
             self.last_keyframe_time = Instant::now();
+            self.keyframe_forced = false;
         }
-        self.stats_bytes += encoded.data.len() as u64;
+        let bytes = encoded.data.len();
+        self.stats_bytes += bytes as u64;
         self.stats_frames += 1;
         self.sequence += 1;
 
@@ -935,10 +962,44 @@ impl SessionRunner {
             sequence: self.sequence,
             frame: Box::new(encoded),
         })?;
+        self.flow.on_sent(self.sequence, bytes);
+        // Send-duration congestion only means something on blocking
+        // transports; once the client acks, the flow window replaces it.
         if let Some(cg) = congestion {
-            cg.on_frame_sent(send_start.elapsed());
+            if !self.flow.is_active() {
+                cg.on_frame_sent(send_start.elapsed());
+            }
         }
         Ok(())
+    }
+
+    /// Make the next encode an IDR, bypassing the flow-control window.
+    pub fn force_keyframe_next(&mut self) {
+        // `needs_keyframe()` turns true on the next tick; Pipeline::tick
+        // honours it via `ctx.needs_keyframe`.
+        self.last_keyframe_time = instant_ago(Duration::from_secs(3600));
+        self.keyframe_forced = true;
+    }
+
+    /// Whether the session loop may produce a video frame now.
+    ///
+    /// Returns false while the client's flow-control window is full. A
+    /// stalled client (no acks for `flow::STALL_AFTER`) gets its window reset
+    /// and a forced keyframe, so it resynchronises instead of gating forever.
+    pub fn flow_allows_frame(&mut self) -> bool {
+        match self.flow.check(self.frame_interval) {
+            crate::flow::FlowVerdict::Send => true,
+            crate::flow::FlowVerdict::Wait => self.keyframe_forced,
+            crate::flow::FlowVerdict::Stalled => {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    stall_s = crate::flow::STALL_AFTER.as_secs(),
+                    "client stopped acking video; resyncing with a keyframe"
+                );
+                self.force_keyframe_next();
+                true
+            }
+        }
     }
 
     /// Send keepalive ping (~1s interval). Returns `Err` if connection lost.
@@ -1009,6 +1070,23 @@ impl SessionRunner {
             #[cfg(not(feature = "audio"))]
             let audio_drops: u64 = 0;
 
+            let flow_str = if self.flow.is_active() {
+                let (inflight, _) = self.flow.backlog();
+                let s = format!(
+                    "on base={:.0}ms queue={:.0}ms delivered={:.0}kbps inflight={} blocked={} stalls={}",
+                    self.flow.base_rtt_ms(),
+                    self.flow.queue_ms(),
+                    self.flow.delivered_kbps(),
+                    inflight,
+                    self.flow.blocked_ticks,
+                    self.flow.stalls,
+                );
+                self.flow.blocked_ticks = 0;
+                s
+            } else {
+                "off".to_string()
+            };
+
             tracing::info!(
                 session_id = %self.session_id,
                 fps = format_args!("{:.1}", fps),
@@ -1017,6 +1095,7 @@ impl SessionRunner {
                 jitter = %jitter_str,
                 encode_ms = format_args!("{:.1}", avg_encode_us as f64 / 1000.0),
                 audio_drops_5s = audio_drops,
+                flow = %flow_str,
                 "{label}"
             );
 
@@ -1045,9 +1124,20 @@ impl SessionRunner {
         Ok(())
     }
 
-    /// Whether it's time to force a periodic keyframe (every 2s).
+    /// Whether the next encode must be a keyframe.
+    ///
+    /// Clients that do not ack get one every 2s: it is their only way back
+    /// from loss or a stale decoder. An acking client asks for what it needs
+    /// (RequestKeyframe, resume, flow stall), so periodic IDRs — the largest
+    /// frames in the stream, sent whether or not anything is wrong — drop to
+    /// a 30s safety net.
     pub fn needs_keyframe(&self) -> bool {
-        self.last_keyframe_time.elapsed() >= Duration::from_secs(2)
+        let interval = if self.flow.is_active() {
+            ACKED_KEYFRAME_INTERVAL
+        } else {
+            UNACKED_KEYFRAME_INTERVAL
+        };
+        self.keyframe_forced || self.last_keyframe_time.elapsed() >= interval
     }
 
     /// Consume the `had_input` flag, returning its previous value.
@@ -1364,6 +1454,7 @@ fn run_session_inner(
     }
 
     let mut abr = AdaptiveBitrate::new(pipeline.bitrate_kbps());
+    let mut rate = crate::flow::RateCtl::for_initial(pipeline.bitrate_kbps());
     let log_label = pipeline.log_label();
 
     loop {
@@ -1375,6 +1466,18 @@ fn run_session_inner(
         runner.poll_clipboard()?;
         // Audio FIRST — tiny packets (~100 bytes), must not be blocked by video.
         runner.drain_audio()?;
+
+        // Ack-based flow control: while the client's window is full, do not
+        // capture or encode at all. The next frame then carries everything
+        // that changed meanwhile, instead of stale frames queueing on the path.
+        if !runner.flow_allows_frame() {
+            // Congestion is exactly when the bitrate has to come down.
+            apply_rate_control(pipeline, &runner.flow, &mut rate);
+            runner.log_stats(log_label);
+            runner.keepalive_tick()?;
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
 
         let ctx = crate::pipeline::TickCtx {
             had_input: runner.take_had_input(),
@@ -1395,18 +1498,43 @@ fn run_session_inner(
 
         runner.drain_file_transfers()?;
 
-        // ABR: snapshot skip_ratio before calling set_bitrate_kbps (both borrow pipeline).
-        let skip_ratio = pipeline.congestion_mut().map(|c| c.skip_ratio).unwrap_or(0);
-        if let Some(new_kbps) = abr.evaluate(runner.rtt_us, runner.jitter_us, skip_ratio) {
-            match pipeline.set_bitrate_kbps(new_kbps) {
-                Ok(()) => abr.apply(new_kbps),
-                Err(e) => tracing::warn!("adaptive bitrate change failed: {e}"),
+        if runner.flow.is_active() {
+            // Acking client: delay-based control from ack measurements.
+            apply_rate_control(pipeline, &runner.flow, &mut rate);
+        } else {
+            // ABR: snapshot skip_ratio before calling set_bitrate_kbps (both borrow pipeline).
+            let skip_ratio = pipeline.congestion_mut().map(|c| c.skip_ratio).unwrap_or(0);
+            if let Some(new_kbps) = abr.evaluate(runner.rtt_us, runner.jitter_us, skip_ratio) {
+                match pipeline.set_bitrate_kbps(new_kbps) {
+                    Ok(()) => abr.apply(new_kbps),
+                    Err(e) => tracing::warn!("adaptive bitrate change failed: {e}"),
+                }
             }
         }
 
         runner.log_stats(log_label);
         runner.keepalive_tick()?;
         runner.frame_pace(loop_start)?;
+    }
+}
+
+/// Feed the ack-based measurements to the delay-based rate controller and
+/// apply its target to the encoder.
+fn apply_rate_control(
+    pipeline: &mut dyn crate::pipeline::Pipeline,
+    flow: &crate::flow::FlowControl,
+    rate: &mut crate::flow::RateCtl,
+) {
+    if let Some(kbps) = rate.update(flow) {
+        match pipeline.set_bitrate_kbps(kbps) {
+            Ok(()) => tracing::debug!(
+                kbps,
+                queue_ms = format_args!("{:.0}", flow.queue_ms()),
+                delivered_kbps = format_args!("{:.0}", flow.delivered_kbps()),
+                "rate control"
+            ),
+            Err(e) => tracing::warn!("rate control bitrate change failed: {e}"),
+        }
     }
 }
 
@@ -1512,6 +1640,7 @@ fn run_session_ipc_inner(
     if let Err(e) = ipc.request_keyframe() {
         tracing::warn!("ipc request_keyframe failed: {e:#}");
     }
+    let mut ipc_keyframe_requested = runner.keyframe_forced;
 
     loop {
         runner.check_cancelled()?;
@@ -1521,6 +1650,21 @@ fn run_session_ipc_inner(
         runner.cursor_state_tick()?;
         runner.poll_clipboard()?;
         runner.drain_audio()?;
+
+        // The agent owns the encoder: forward keyframe needs (client
+        // RequestKeyframe, resume, an acking client that stalled) to it.
+        // Without this, service-mode clients waited for the agent's own
+        // periodic keyframe. The agent cannot be paused from here, so the
+        // flow window is not enforced on this path; a stall still resyncs.
+        let _ = runner.flow_allows_frame();
+        if runner.keyframe_forced && !ipc_keyframe_requested {
+            ipc_keyframe_requested = true;
+            if let Err(e) = ipc.request_keyframe() {
+                tracing::warn!("ipc request_keyframe failed: {e:#}");
+            }
+        } else if !runner.keyframe_forced {
+            ipc_keyframe_requested = false;
+        }
 
         // Forward queued encoded frames from agent (H.264 must be sequential).
         // If we sent a prewarmed startup frame, skip any queued delta frames

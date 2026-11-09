@@ -20,6 +20,25 @@ pub struct GpuProbeResult {
 }
 
 impl GpuProbeResult {
+    /// A result that selects CPU capture and encode, without touching CUDA.
+    ///
+    /// For callers that already know they want the CPU path: `probe()`
+    /// initialises CUDA, and on hybrid-GPU (Optimus) laptops that ties the
+    /// process to the discrete GPU — Desktop Duplication of a display driven
+    /// by the integrated GPU then fails (`examples/capture_bench.rs --cuda`).
+    pub fn cpu_only() -> Self {
+        Self {
+            has_cuda: false,
+            has_nvenc: false,
+            has_av1: false,
+            #[cfg(target_os = "linux")]
+            has_nvfbc: false,
+            #[cfg(target_os = "windows")]
+            has_dxgi: false,
+            gpu_name: None,
+        }
+    }
+
     /// Best encoder based on what's available.
     pub fn best_encoder(&self) -> &'static str {
         if self.has_nvenc {

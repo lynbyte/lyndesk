@@ -3,3 +3,7 @@
 //! without forcing CUDA on every build.
 
 pub mod h264;
+
+/// x264 (optional `x264` feature, GPL).
+#[cfg(feature = "x264")]
+pub mod x264;

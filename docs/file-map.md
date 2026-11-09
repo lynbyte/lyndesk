@@ -28,6 +28,8 @@ crates/server/src/                Capture → encode → ship pixels
   pipeline.rs                       Pipeline trait + 3 impls: CpuPipeline,
                                     NvfbcNvencPipeline, DxgiNvencPipelineAdapter
                                     (0.4.7 — unifies the 3 capture+encode backends)
+  flow.rs                           Ack-based video flow control (FlowControl) +
+                                    delay-based rate control (RateCtl)
   doorbell.rs                       Session-affinity policy: ghost-set LRU prevents
                                     kicked browser tabs from thrashing real sessions
   ipc_pipe.rs                       Windows-only: named-pipe IPC between service
@@ -79,6 +81,9 @@ crates/server/src/                Capture → encode → ship pixels
 
 crates/server/examples/
   transport_smoke.rs                Synthetic H.264/Opus idle-to-motion source
+  wan_bench.rs                      WAN benchmark: real session loop + OpenH264 +
+                                    WSS send path through a bottleneck link;
+                                    marker latency, unique FPS, PSNR, ack/noack
   probe_transport.mjs               Chrome CDP rendered-pixel age probe (Node 22+)
 
 crates/client/src/                Native client (winit + softbuffer)

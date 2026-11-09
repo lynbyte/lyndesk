@@ -140,6 +140,14 @@ struct AppState {
     /// After the fence arrives, still wait for the first keyframe before
     /// resuming decode so the decoder restarts from a fresh reference.
     drop_until_keyframe: bool,
+    /// Server speaks protocol v10+ and understands `VideoAck` (ack-based
+    /// flow control). Older servers would treat the unknown message as a
+    /// protocol error, so acks are only sent when this is set.
+    video_ack_supported: bool,
+    /// The WebCodecs decoder reported an error (it is closed afterwards).
+    /// The next VideoFrame rebuilds it and asks for a keyframe; without this
+    /// a decode error froze the picture until reconnect.
+    decoder_failed: bool,
     control_assembler: ChunkAssembler,
     /// For sending input — either the input DataChannel or WebSocket fallback.
     send_input_dc: Option<web_sys::RtcDataChannel>,
@@ -418,6 +426,8 @@ pub fn main() {
         got_keyframe: false,
         waiting_for_keyframe_fence: false,
         drop_until_keyframe: false,
+        video_ack_supported: false,
+        decoder_failed: false,
         control_assembler: ChunkAssembler::new(),
         send_input_dc: None,
         send_control_dc: None,
@@ -1562,6 +1572,7 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             let mut s = state.borrow_mut();
             s.server_width = width;
             s.server_height = height;
+            s.video_ack_supported = protocol_version >= 10;
             let rtc_media_active = s.rtc2_media_active;
             update_debug_snapshot(&s);
             drop(s);
@@ -1587,11 +1598,24 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
         }
         Message::CursorUpdate(cursor) => handle_cursor_update(state, cursor),
         Message::CursorShape(shape) => handle_cursor_shape(state, shape),
-        Message::VideoFrame { sequence: _, frame } => {
+        Message::VideoFrame { sequence, frame } => {
+            let mut s = state.borrow_mut();
             if frame.data.is_empty() {
+                send_video_ack(&s, sequence);
                 return;
             }
-            let mut s = state.borrow_mut();
+            if s.decoder_failed {
+                s.decoder_failed = false;
+                let (w, h) = (s.server_width, s.server_height);
+                send_video_ack(&s, sequence);
+                drop(s);
+                console::warn_1(
+                    &"video decoder failed; rebuilding and requesting a keyframe".into(),
+                );
+                setup_decoder(state, w, h, frame.codec);
+                begin_video_recovery(state, "decoder error");
+                return;
+            }
 
             let is_key = match frame.codec {
                 VideoCodec::H264 => h264_has_idr(&frame.data),
@@ -1602,7 +1626,10 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 }
             };
 
+            // Frames dropped on purpose are acked at once: they are done as
+            // far as the server's flow-control window is concerned.
             if s.waiting_for_keyframe_fence {
+                send_video_ack(&s, sequence);
                 return;
             }
             if s.drop_until_keyframe {
@@ -1610,6 +1637,7 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                     console::log_1(&"video recovery: fresh keyframe received, resuming".into());
                     s.drop_until_keyframe = false;
                 } else {
+                    send_video_ack(&s, sequence);
                     return;
                 }
             }
@@ -1641,6 +1669,7 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                     &format!("skipping frame #{} (waiting for keyframe)", s.frame_count).into(),
                 );
                 s.frame_count += 1;
+                send_video_ack(&s, sequence);
                 return;
             }
             if is_key {
@@ -1648,19 +1677,25 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             }
             s.frame_count += 1;
             update_debug_snapshot(&s);
-            let fc = s.frame_count;
+            if s.decoder.is_none() {
+                send_video_ack(&s, sequence);
+                return;
+            }
+            let decoder_closed = s.decoder.as_ref().is_some_and(|decoder| {
+                js_sys::Reflect::get(decoder.as_ref(), &"state".into())
+                    .ok()
+                    .and_then(|v| v.as_string())
+                    .is_some_and(|st| st == "closed")
+            });
+            if decoder_closed {
+                // decode() on a closed decoder throws through the wasm frame
+                // and would leave this RefCell borrowed; rebuild instead.
+                console::warn_1(&"Decoder closed, skipping frame".into());
+                s.decoder_failed = true;
+                send_video_ack(&s, sequence);
+                return;
+            }
             if let Some(ref decoder) = s.decoder {
-                // If tab was backgrounded, decoder may be stale. Reset on keyframe.
-                if is_key {
-                    let state_str = js_sys::Reflect::get(decoder.as_ref(), &"state".into())
-                        .ok()
-                        .and_then(|v| v.as_string())
-                        .unwrap_or_default();
-                    if state_str == "closed" {
-                        console::warn_1(&"Decoder closed, skipping frame".into());
-                        return;
-                    }
-                }
                 let data_js = js_sys::Uint8Array::from(frame.data.as_slice());
                 let init = js_sys::Object::new();
                 js_sys::Reflect::set(
@@ -1669,7 +1704,10 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                     &if is_key { "key" } else { "delta" }.into(),
                 )
                 .unwrap();
-                js_sys::Reflect::set(&init, &"timestamp".into(), &(fc as f64 * 33333.0).into())
+                // The timestamp carries the server sequence through the
+                // decoder, so the output callback can ack the exact frame it
+                // painted. WebCodecs treats it as opaque, increasing metadata.
+                js_sys::Reflect::set(&init, &"timestamp".into(), &(sequence as f64).into())
                     .unwrap();
                 js_sys::Reflect::set(&init, &"data".into(), &data_js.buffer()).unwrap();
                 let chunk = JsEncodedVideoChunk::new(&init);
@@ -1912,14 +1950,28 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32, codec: 
         if canvas.height() != h {
             canvas.set_height(h);
         }
+        // Read before the frame is closed: the timestamp is the server
+        // sequence (see the VideoFrame handler).
+        let sequence = js_sys::Reflect::get(&frame, &"timestamp".into())
+            .ok()
+            .and_then(|v| v.as_f64());
         let js_code = format!(
             "var c=document.getElementById('screen').getContext('2d'); c.drawImage(__phantom_frame, 0, 0, {w}, {h}); __phantom_frame.close();"
         );
         js_sys::eval(&js_code).unwrap_or(JsValue::NULL);
+        // Painted: let the server's flow-control window advance.
+        if let Some(seq) = sequence.filter(|v| *v >= 0.0) {
+            send_video_ack(&s.borrow(), seq as u64);
+        }
     });
 
-    let error_cb = Closure::<dyn FnMut(JsValue)>::new(|e: JsValue| {
+    let failed_state = state.clone();
+    let error_cb = Closure::<dyn FnMut(JsValue)>::new(move |e: JsValue| {
         console::error_1(&format!("Decode error: {:?}", e).into());
+        // WebCodecs closes the decoder after an error; recover on the next frame.
+        if let Ok(mut st) = failed_state.try_borrow_mut() {
+            st.decoder_failed = true;
+        }
     });
 
     let init = js_sys::Object::new();
@@ -3351,6 +3403,13 @@ fn send_resolution_change(state: &Rc<RefCell<AppState>>) {
 
 fn send_message(state: &AppState, msg: &Message) {
     let _ = try_send_message(state, msg);
+}
+
+/// Cumulative video ack for the server's flow control (protocol v10+).
+fn send_video_ack(state: &AppState, sequence: u64) {
+    if state.video_ack_supported {
+        send_message(state, &Message::VideoAck { sequence });
+    }
 }
 
 fn try_send_message(state: &AppState, msg: &Message) -> bool {

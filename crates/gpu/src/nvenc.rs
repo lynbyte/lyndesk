@@ -166,6 +166,7 @@ impl NvencEncoder {
         config.set_rc_mode(NV_ENC_PARAMS_RC_CBR);
         config.set_avg_bitrate(bitrate_kbps * 1000);
         config.set_max_bitrate(bitrate_kbps * 1000 * 2);
+        config.set_single_frame_vbv(bitrate_kbps * 1000, fps);
         // Note: set_repeat_sps_pps(true) was attempted but offset 152 is unreliable
         // across drivers. Instead, we recreate the encoder per session to get SPS/PPS.
 
@@ -538,6 +539,7 @@ impl FrameEncoder for NvencEncoder {
         // Update the encode config with new bitrate
         self.encode_config.set_avg_bitrate(kbps * 1000);
         self.encode_config.set_max_bitrate(kbps * 1000 * 2);
+        self.encode_config.set_single_frame_vbv(kbps * 1000, self.fps);
 
         // Point init_params at the updated config
         self.init_params
@@ -547,7 +549,10 @@ impl FrameEncoder for NvencEncoder {
         let mut reconfig = NvEncReconfigureParams::zeroed();
         reconfig.set_version();
         reconfig.set_init_params_from(&self.init_params);
-        reconfig.set_force_idr(true);
+        // A bitrate-only change needs neither resetEncoder nor an IDR (NVENC
+        // supports dynamic bitrate change in place). Forcing one would send a
+        // large keyframe exactly when rate control backs off for congestion.
+        reconfig.set_force_idr(false);
 
         let status = unsafe { f(self.encoder, reconfig.as_mut_ptr()) };
         if status != NV_ENC_SUCCESS {

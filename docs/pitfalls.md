@@ -259,6 +259,21 @@ you're making touches one of these areas, re-read the relevant entry first.
 - **OpenH264 SIMD**: must use `phantom_core::color::bgra_to_yuv420`
   (AVX2 SIMD), NOT `pixel_f32()` callback. Per-pixel f32 = ~300ms/frame
   at 1080p; SIMD = ~10ms.
+- **OpenH264 bitrate change must not recreate the encoder**: recreating
+  emits an IDR — the largest frame of the stream, exactly when rate control
+  is backing off for congestion. Use `SetOption(ENCODER_OPTION_BITRATE)`
+  through `raw_api()` once the encoder has encoded a frame (the openh264
+  crate initialises lazily). Same for NVENC: `nvEncReconfigureEncoder` with
+  `forceIDR = 0` for a bitrate-only change.
+- **OpenH264 scene-change detection turns scrolling into keyframes**: with
+  the default `bEnableSceneChangeDetect`, a scrolled page produced an
+  I-frame every ~0.6 s (13 in 8 s, `wan_bench` scroll workload). The crate
+  doesn't expose it; `OpenH264Encoder::tune_after_init` clears it via
+  Get/SetOption(`ENCODER_OPTION_SVC_ENCODE_PARAM_EXT`).
+- **OpenH264 frame skip drops whole frames instead of raising QP**: with
+  `enable_skip_frame(true)`, a 1080p scroll held to 1.5–2 Mbps came out at
+  4–5 fps. Skip is off; pacing to the link is the flow-control window's
+  job (`flow.rs`).
 
 ## Decode (client)
 - **Native clipboard I/O must not run on the UI thread**: on macOS,
@@ -339,6 +354,32 @@ you're making touches one of these areas, re-read the relevant entry first.
   whenever RTT >100ms (fixed latency). Fix: track baseline RTT (minimum
   observed), only decrease when RTT rises >50% above baseline (actual
   congestion).
+- **Send time says nothing on WSS**: `WsSender::send_msg` only pushes into
+  a bounded channel, so `CongestionTracker` (send duration > 2 frame
+  intervals) never fired there; latency built up in kernel/proxy buffers
+  unseen. Acking clients now get ack-based flow control (`flow.rs`); the
+  old trackers remain for clients that never ack.
+- **Frame size is not queueing**: the ack delay of a big frame includes its
+  own transmission time (a 20 KB frame is 32 ms on 5 Mbps). Subtract it
+  before computing queue delay, or big frames read as congestion and the
+  rate ratchets down (5000 → 1500 kbps in 4 s).
+- **…and don't subtract an estimated transmission time either**: dividing
+  by the delivery rate (even its 10 s max) overestimates transmission time
+  while the sender is app-limited; base fell below the RTT (16 ms on a 40 ms
+  link) and every frame read as 40 ms queued. Queue delay is now the
+  minimum delay over 200 ms above the base (CoDel-style), which needs no
+  capacity estimate.
+- **Count bytes in flight, not just frames**: one ~400 KB full-screen-change
+  frame counts as one, so four more frames queued behind it and each landed
+  400+ ms late (scroll p99 545 ms at 10 Mbps). A byte budget fixes that, but
+  exactly 1×BDP starved the pipe (2 Mbps scroll 18 → 7 fps); 2×BDP (BBR's
+  cwnd gain) with a 48 KB floor keeps both.
+- **No periodic keyframes needs decoder-error recovery**: the web client
+  used to only log WebCodecs errors; the 2 s keyframe hid it. With acking
+  clients on a 30 s safety interval, a decode error now rebuilds the
+  decoder and sends `RequestKeyframe` (`decoder_failed`), and `decode()` is
+  never called on a `closed` decoder (it throws through the wasm frame and
+  leaves the `AppState` RefCell borrowed).
 
 ## Autologin mode (Linux VM)
 - **"Switch User" backgrounds the session**: clicking GNOME's Switch

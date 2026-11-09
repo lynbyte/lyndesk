@@ -559,3 +559,199 @@ fn bitrate_remains_sensible_under_idle() {
         "bitrate drifted to unreasonable value: {final_kbps} kbps"
     );
 }
+
+/// Wait until the outbox holds a VideoFrame with sequence > `after`; returns
+/// the highest sequence seen.
+fn wait_for_video_after(h: &Harness, after: u64, deadline: Duration) -> Option<u64> {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        let max = h
+            .sent()
+            .iter()
+            .filter_map(|m| match m {
+                Message::VideoFrame { sequence, .. } => Some(*sequence),
+                _ => None,
+            })
+            .max();
+        if let Some(seq) = max.filter(|s| *s > after) {
+            return Some(seq);
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    None
+}
+
+fn video_frames_after(msgs: &[Message], after: u64) -> usize {
+    count_variants(
+        msgs,
+        |m| matches!(m, Message::VideoFrame { sequence, .. } if *sequence > after),
+    )
+}
+
+#[test]
+fn acked_session_stops_at_flow_window_and_resumes_on_ack() {
+    let _lock = test_lock();
+    let (h, fill) = Harness::start(64, 64, 10_000);
+    assert!(
+        h.wait_for_ready(Duration::from_secs(3)),
+        "session not ready"
+    );
+    let first = wait_for_video_after(&h, 0, Duration::from_secs(3)).expect("first frame");
+    // The client acks once, which turns flow control on, then goes silent.
+    h.input_tx
+        .send(Message::VideoAck { sequence: first })
+        .unwrap();
+    let busy = |ms: u64| {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(ms) {
+            {
+                let mut f = fill.lock().unwrap();
+                *f = f.wrapping_add(1);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    };
+    busy(700);
+    let msgs = h.sent();
+    let unacked = video_frames_after(&msgs, first);
+    // At 33ms frames and a small measured RTT the window is a handful of
+    // frames; without flow control 700ms of motion would send ~20.
+    assert!(
+        (1..=6).contains(&unacked),
+        "expected the flow window to cap unacked frames, got {unacked}"
+    );
+
+    // Acking everything reopens the window.
+    let last = wait_for_video_after(&h, first, Duration::from_secs(1)).unwrap();
+    h.input_tx
+        .send(Message::VideoAck { sequence: last })
+        .unwrap();
+    let more = {
+        let start = Instant::now();
+        loop {
+            {
+                let mut f = fill.lock().unwrap();
+                *f = f.wrapping_add(1);
+            }
+            if let Some(s) = wait_for_video_after(&h, last, Duration::from_millis(20)) {
+                break Some(s);
+            }
+            if start.elapsed() > Duration::from_secs(2) {
+                break None;
+            }
+        }
+    };
+    h.stop();
+    assert!(more.is_some(), "ack did not reopen the flow window");
+}
+
+#[test]
+fn session_without_acks_is_not_flow_controlled() {
+    let _lock = test_lock();
+    let (h, fill) = Harness::start(64, 64, 10_000);
+    assert!(
+        h.wait_for_ready(Duration::from_secs(3)),
+        "session not ready"
+    );
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(700) {
+        {
+            let mut f = fill.lock().unwrap();
+            *f = f.wrapping_add(1);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let msgs = h.sent();
+    h.stop();
+    let frames = video_frames_after(&msgs, 0);
+    assert!(
+        frames > 8,
+        "a client that never acks must keep the old behaviour, got {frames} frames"
+    );
+}
+
+/// Drive motion and (optionally) ack every frame the session sends, for `ms`.
+fn run_motion(h: &Harness, fill: &Arc<Mutex<u8>>, ms: u64, ack: bool) {
+    let start = Instant::now();
+    let mut acked = 0u64;
+    while start.elapsed() < Duration::from_millis(ms) {
+        {
+            let mut f = fill.lock().unwrap();
+            *f = f.wrapping_add(1);
+        }
+        if ack {
+            if let Some(seq) = wait_for_video_after(h, acked, Duration::from_millis(1)) {
+                h.input_tx
+                    .send(Message::VideoAck { sequence: seq })
+                    .unwrap();
+                acked = seq;
+            }
+        }
+        thread::sleep(Duration::from_millis(4));
+    }
+}
+
+#[test]
+fn acking_client_gets_no_periodic_keyframes() {
+    let _lock = test_lock();
+    let (h, fill) = Harness::start(64, 64, 100_000);
+    assert!(
+        h.wait_for_ready(Duration::from_secs(3)),
+        "session not ready"
+    );
+    run_motion(&h, &fill, 2600, true);
+    let keyframes = *h.keyframe_count.lock().unwrap();
+    let frames = video_frames_after(&h.sent(), 0);
+    h.stop();
+    assert!(
+        frames > 20,
+        "acked stream should keep flowing, got {frames}"
+    );
+    assert_eq!(
+        keyframes, 1,
+        "only the initial keyframe expected while the client acks"
+    );
+}
+
+#[test]
+fn non_acking_client_keeps_periodic_keyframes() {
+    let _lock = test_lock();
+    let (h, fill) = Harness::start(64, 64, 100_000);
+    assert!(
+        h.wait_for_ready(Duration::from_secs(3)),
+        "session not ready"
+    );
+    run_motion(&h, &fill, 2600, false);
+    let keyframes = *h.keyframe_count.lock().unwrap();
+    h.stop();
+    assert!(
+        keyframes >= 2,
+        "expected a periodic keyframe, got {keyframes}"
+    );
+}
+
+#[test]
+fn keyframe_request_bypasses_full_flow_window() {
+    let _lock = test_lock();
+    let (h, fill) = Harness::start(64, 64, 100_000);
+    assert!(
+        h.wait_for_ready(Duration::from_secs(3)),
+        "session not ready"
+    );
+    let first = wait_for_video_after(&h, 0, Duration::from_secs(3)).expect("first frame");
+    h.input_tx
+        .send(Message::VideoAck { sequence: first })
+        .unwrap();
+    // Fill the window: no further acks.
+    run_motion(&h, &fill, 500, false);
+    let before = *h.keyframe_count.lock().unwrap();
+    h.input_tx.send(Message::RequestKeyframe).unwrap();
+    run_motion(&h, &fill, 300, false);
+    let after = *h.keyframe_count.lock().unwrap();
+    h.stop();
+    assert_eq!(
+        after,
+        before + 1,
+        "requested keyframe must pass a full window"
+    );
+}

@@ -190,6 +190,10 @@ struct Session {
     audio: Option<audio_playback::Playback>,
     /// Session token for reconnect.
     session_token: Vec<u8>,
+    /// Server speaks protocol v10+: ack painted frames (`VideoAck`, drives
+    /// its flow control) and ask for a keyframe after a decode error, since
+    /// an acking client no longer gets periodic 2s keyframes.
+    video_ack: bool,
     /// File transfer handler.
     file_xfer: file_transfer::ClientFileTransfer,
 }
@@ -605,6 +609,7 @@ impl App {
             audio,
             file_xfer: file_transfer::ClientFileTransfer::new(),
             session_token: new_session_token,
+            video_ack: protocol_version >= 10,
         });
     }
 }
@@ -653,11 +658,16 @@ impl ApplicationHandler for App {
                 // Process received frames — decode every VideoFrame to maintain
                 // decoder state, but only render the last decoded result.
                 let mut last_decoded = None;
+                let mut ack_upto: Option<u64> = None;
+                let mut decode_failed = false;
                 let mut clipboard_msgs = Vec::new();
                 let mut title_toast: Option<(String, Instant)> = None;
                 while let Ok(msg) = session.frame_rx.try_recv() {
                     match msg {
-                        Message::VideoFrame { frame, .. } => {
+                        Message::VideoFrame { sequence, frame } => {
+                            // Decoded (or failed) either way: it no longer
+                            // occupies the server's flow-control window.
+                            ack_upto = Some(sequence);
                             let decode_start = std::time::Instant::now();
                             match session.decoder.decode_frame(&frame.data) {
                                 Ok(rgb32) if !rgb32.is_empty() => {
@@ -678,6 +688,7 @@ impl ApplicationHandler for App {
                                 // and do not count empty output as video FPS.
                                 Ok(_) => {}
                                 Err(e) => {
+                                    decode_failed = true;
                                     tracing::warn!(
                                         size = frame.data.len(),
                                         keyframe = frame.is_keyframe,
@@ -783,6 +794,14 @@ impl ApplicationHandler for App {
                 }
                 if let Some(rgb32) = last_decoded {
                     session.display.update_full_frame(&rgb32);
+                }
+                if session.video_ack {
+                    if let Some(sequence) = ack_upto {
+                        let _ = session.input_tx.send(Message::VideoAck { sequence });
+                    }
+                    if decode_failed {
+                        let _ = session.input_tx.send(Message::RequestKeyframe);
+                    }
                 }
 
                 // Clipboard from server

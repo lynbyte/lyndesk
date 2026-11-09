@@ -14,6 +14,10 @@ webrtc = ["dep:dimpl", "dep:crc32fast", "dep:phantom-sctp", "dep:aes", "dep:aes-
 audio = ["audiopus", "audiopus_sys", "libpulse-binding", "libpulse-simple-binding", "windows"]  # Audio capture: PulseAudio on Linux, WASAPI on Windows
 wayland = ["dep:pipewire", "dep:dbus"]  # Wayland screen capture via PipeWire + XDG Portal
 sso = []  # SSO agent: write auth ticket after JWT verified, for pam_phantom / phantom_cp plugins
+# x264 CPU encoder (`--encoder x264`). Links a static libx264 built by
+# scripts/build-x264.sh. x264 is GPL-2.0+: a binary with this feature is GPL.
+# Off by default, so default builds stay MIT.
+x264 = ["dep:cc"]
 
 [dependencies]
 phantom-core = { path = "../core" }
@@ -44,6 +48,8 @@ serde_json = "1"
 enigo = "0.3"
 arboard = "3"
 openh264 = "0.6"
+# Raw SetOption constants/types for runtime bitrate changes without an IDR.
+openh264-sys2 = "0.6"
 phantom-gpu = { path = "../gpu" }
 # Audio: request static Opus; pkg-config can still select the system library.
 # The Linux installer also supplies the shared runtime for those builds.
@@ -84,3 +90,6 @@ windows = { version = "0.58", optional = true, features = [
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
 windows-service = "0.7"
+
+[build-dependencies]
+cc = { version = "1", optional = true }

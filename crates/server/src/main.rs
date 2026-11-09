@@ -83,7 +83,8 @@ struct Args {
     #[arg(long)]
     no_encrypt: bool,
 
-    /// Video encoder: auto (default, probes GPU), openh264 (CPU), nvenc (NVIDIA GPU).
+    /// Video encoder: auto (default, probes GPU), openh264 (CPU), nvenc (NVIDIA GPU),
+    /// x264 (CPU, builds with `--features x264` only; GPL).
     #[arg(long, default_value = "auto")]
     encoder: String,
 
@@ -94,7 +95,7 @@ struct Args {
     #[arg(long, default_value = "auto")]
     codec: String,
 
-    /// Screen capture: auto (default, probes GPU/Wayland), scrap (CPU/X11), nvfbc (NVIDIA GPU), pipewire (Wayland).
+    /// Screen capture: auto (default, probes GPU/Wayland), scrap (CPU/X11), nvfbc (NVIDIA GPU), pipewire (Wayland), gdi (Windows GDI fallback).
     #[arg(long, default_value = "auto")]
     capture: String,
 
@@ -494,7 +495,17 @@ fn main() -> Result<()> {
         Some(key)
     };
 
-    let gpu_probe = phantom_gpu::probe::probe();
+    // Probe the GPU only when a choice depends on it. The probe initialises
+    // CUDA; on hybrid-GPU (Optimus) laptops that binds the process to the
+    // discrete GPU, and Desktop Duplication (scrap) of a display driven by
+    // the integrated GPU then fails — forcing GDI capture, ~3.6x slower per
+    // grab (16.3 vs 4.5 ms at 1080p, examples/capture_bench.rs).
+    let cpu_encoder = matches!(args.encoder.as_str(), "openh264" | "x264");
+    let gpu_probe = if cpu_encoder {
+        phantom_gpu::probe::GpuProbeResult::cpu_only()
+    } else {
+        phantom_gpu::probe::probe()
+    };
     // `mut` used only on linux/windows fallback paths.
     #[allow(unused_mut)]
     let (mut encoder_name, mut capture_name, video_codec) =
@@ -556,7 +567,19 @@ fn main() -> Result<()> {
     let _gpu: Option<()> = None;
 
     let mut capture: Option<Box<dyn phantom_core::capture::FrameCapture>> = if !use_gpu_pipeline {
-        Some(create_capture(&capture_name, args.display)?)
+        match create_capture(&capture_name, args.display) {
+            Ok(c) => Some(c),
+            // Desktop Duplication can be unavailable (hybrid GPU with CUDA
+            // already initialised, RDP, some virtual displays); GDI always
+            // works, just slower. Better a stream than an exit.
+            #[cfg(target_os = "windows")]
+            Err(e) if capture_name == "scrap" => {
+                tracing::warn!("scrap capture unavailable ({e:#}); falling back to GDI capture");
+                capture_name = "gdi".to_string();
+                Some(create_capture(&capture_name, args.display)?)
+            }
+            Err(e) => return Err(e),
+        }
     } else {
         None
     };
@@ -582,14 +605,31 @@ fn main() -> Result<()> {
     };
 
     let mut video_encoder: Option<Box<dyn FrameEncoder>> = if !use_gpu_pipeline {
-        Some(create_encoder(
+        match create_encoder(
             &encoder_name,
             width,
             height,
             args.fps as f32,
             args.bitrate,
             video_codec,
-        )?)
+        ) {
+            Ok(e) => Some(e),
+            // `auto` picked NVENC because its library is installed, but the
+            // GPU may have no encoder (e.g. GeForce MX series). Fall back.
+            Err(e) if args.encoder == "auto" && encoder_name == "nvenc" => {
+                tracing::warn!("NVENC unavailable ({e:#}); falling back to OpenH264");
+                encoder_name = "openh264".to_string();
+                Some(create_encoder(
+                    &encoder_name,
+                    width,
+                    height,
+                    args.fps as f32,
+                    args.bitrate,
+                    VideoCodec::H264,
+                )?)
+            }
+            Err(e) => return Err(e),
+        }
     } else {
         None
     };
@@ -1091,7 +1131,9 @@ fn resolve_media_config(
 
     // If encoder is explicitly non-GPU but capture resolved to a GPU-only
     // method, fix it. The CPU encoder needs CPU-visible BGRA frames.
-    if encoder_name == "openh264" && (capture_name == "nvfbc" || capture_name == "dxgi") {
+    if (encoder_name == "openh264" || encoder_name == "x264")
+        && (capture_name == "nvfbc" || capture_name == "dxgi")
+    {
         tracing::info!(
             "encoder is openh264, overriding capture from {} to scrap",
             capture_name
@@ -1564,12 +1606,23 @@ fn create_capture(
             let cap = capture::pipewire::PipeWireCapture::new()?;
             Ok(Box::new(cap))
         }
+        #[cfg(target_os = "windows")]
+        "gdi" => {
+            if display_index != 0 {
+                tracing::warn!("GDI capture: --display is ignored (captures the primary monitor)");
+            }
+            let cap = capture::gdi::GdiCapture::new_primary_monitor()?;
+            Ok(Box::new(cap))
+        }
         other => {
-            let available = if cfg!(feature = "wayland") {
-                "scrap, pipewire, nvfbc"
+            let mut available = if cfg!(feature = "wayland") {
+                "scrap, pipewire, nvfbc".to_string()
             } else {
-                "scrap, nvfbc (use with --encoder nvenc for GPU pipeline)"
+                "scrap, nvfbc (use with --encoder nvenc for GPU pipeline)".to_string()
             };
+            if cfg!(target_os = "windows") {
+                available.push_str(", gdi");
+            }
             anyhow::bail!("unknown capture '{other}'. Available: {available}")
         }
     }
@@ -1604,7 +1657,21 @@ fn create_encoder(
             )?;
             Ok(Box::new(enc))
         }
-        other => anyhow::bail!("unknown encoder '{other}'. Available: openh264, nvenc"),
+        #[cfg(feature = "x264")]
+        "x264" => {
+            if codec == VideoCodec::Av1 {
+                anyhow::bail!("x264 does not support AV1. Use --encoder nvenc for AV1.");
+            }
+            encode::x264::boxed(width, height, fps, bitrate_kbps)
+        }
+        other => anyhow::bail!(
+            "unknown encoder '{other}'. Available: openh264, nvenc{}",
+            if cfg!(feature = "x264") {
+                ", x264"
+            } else {
+                " (x264 needs a build with --features x264)"
+            }
+        ),
     }
 }
 

@@ -718,6 +718,38 @@ fn serve_static(stream: &mut (impl Read + Write), path: &str, keep_alive: bool) 
     Ok(())
 }
 
+/// Run the WSS session machinery — the same bounded video queue, I/O loop
+/// and recovery-keyframe requests as an HTTPS WebSocket — over an already
+/// connected plain TCP stream, without TLS or the HTTP upgrade. For
+/// benchmarks and tests that need the real WSS send path without
+/// certificates; the peer speaks raw (client-masked) WebSocket frames.
+pub fn raw_ws_session(stream: std::net::TcpStream) -> std::io::Result<(WsSender, WsReceiver)> {
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(Some(WS_SOCKET_WRITE_TIMEOUT))?;
+    stream.set_nodelay(true)?;
+    let ws = tungstenite::WebSocket::from_raw_socket(
+        WsPollSocket(stream),
+        tungstenite::protocol::Role::Server,
+        None,
+    );
+    let (send_tx, send_rx) = mpsc::sync_channel(WS_VIDEO_SEND_QUEUE_DEPTH);
+    let (recv_tx, recv_rx) = mpsc::channel();
+    let recovery = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let io_recovery = recovery.clone();
+    std::thread::spawn(move || ws_io_loop(ws, send_rx, recv_tx, io_recovery));
+    Ok((
+        WsSender {
+            tx: send_tx,
+            dropping_video_until_keyframe: false,
+            video_backlog_started_at: None,
+            recovery,
+            dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            audio: None,
+        },
+        WsReceiver { rx: recv_rx },
+    ))
+}
+
 fn spawn_ws_connection(
     stream: rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>,
     ws_tx: mpsc::Sender<WsConnection>,

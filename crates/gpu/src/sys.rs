@@ -352,6 +352,22 @@ impl NvEncConfig {
     pub fn set_max_bitrate(&mut self, v: u32) {
         self.write_u32(40 + 24, v);
     }
+    // NV_ENC_RC_PARAMS.vbvBufferSize / vbvInitialDelay follow maxBitRate.
+    pub fn set_vbv_buffer_size(&mut self, bits: u32) {
+        self.write_u32(40 + 28, bits);
+    }
+    pub fn set_vbv_initial_delay(&mut self, bits: u32) {
+        self.write_u32(40 + 32, bits);
+    }
+    /// Bound every frame to about one frame's worth of `avg_bps` (NVIDIA's
+    /// low-latency recommendation). Without it NVENC's default VBV lets a
+    /// full-screen change come out many times the per-frame budget, which
+    /// then takes hundreds of ms to cross a constrained link.
+    pub fn set_single_frame_vbv(&mut self, avg_bps: u32, fps: u32) {
+        let frame_bits = avg_bps / fps.max(1);
+        self.set_vbv_buffer_size(frame_bits);
+        self.set_vbv_initial_delay(frame_bits);
+    }
     // encodeCodecConfig starts at offset 152
     // h264Config.repeatSPSPPS is bit 0 of the uint32_t at offset 152
     pub fn set_repeat_sps_pps(&mut self, enable: bool) {
@@ -933,4 +949,23 @@ pub struct NvFbcFunctionList {
     pub to_cuda_grab_frame: FnNvFbcApi,
     pub bind_context: FnNvFbcApi,
     pub release_context: FnNvFbcApi,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NV_ENC_RC_PARAMS (SDK 12): version, rateControlMode, constQP (3 x u32),
+    /// averageBitRate @20, maxBitRate @24, vbvBufferSize @28, vbvInitialDelay @32.
+    #[test]
+    fn rc_params_vbv_fields_follow_max_bitrate() {
+        let mut c = NvEncConfig::zeroed();
+        c.set_avg_bitrate(5_000_000);
+        c.set_max_bitrate(10_000_000);
+        c.set_single_frame_vbv(5_000_000, 30);
+        assert_eq!(c.read_u32(40 + 20), 5_000_000);
+        assert_eq!(c.read_u32(40 + 24), 10_000_000);
+        assert_eq!(c.read_u32(40 + 28), 166_666);
+        assert_eq!(c.read_u32(40 + 32), 166_666);
+    }
 }

@@ -108,6 +108,7 @@ impl DxgiNvencPipeline {
         config.set_rc_mode(NV_ENC_PARAMS_RC_CBR);
         config.set_avg_bitrate(bitrate_kbps * 1000);
         config.set_max_bitrate(bitrate_kbps * 1000 * 2);
+        config.set_single_frame_vbv(bitrate_kbps * 1000, fps);
         // Do NOT call set_repeat_sps_pps — unreliable across drivers (537 ignores,
         // 550 returns INVALID_PARAM). SPS/PPS save+prepend handles this instead.
 

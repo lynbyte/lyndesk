@@ -20,6 +20,7 @@ pub mod display_ccd;
 pub mod doorbell;
 pub mod encode;
 pub mod file_transfer;
+pub mod flow;
 pub mod input_injector;
 #[cfg(target_os = "linux")]
 pub mod input_uinput;

@@ -104,13 +104,46 @@ input pumping, clipboard, audio drain, keepalive, stats, adaptive
 bitrate, frame pacing, file-transfer drain — all transport- and
 backend-agnostic.
 
-### Periodic keyframes (2s interval)
+### Ack-based flow control + delay-based rate control (protocol v10)
 
-Server forces IDR every 2 seconds. Recovers from:
+Web (WebCodecs/WSS path) and native clients send `VideoAck { sequence }`
+once a frame is decoded and painted (dropped frames are acked at once).
+`crates/server/src/flow.rs`:
+
+- `FlowControl` keeps a window of frames in flight — enough for one round
+  trip plus decode, `ceil((rtt+40)/interval)+2` clamped to 3..40, and no
+  frame older than `rtt+120ms`, and no more bytes in flight than 2× the
+  path's capacity × (rtt+40ms) (floor 48 KB; capacity = 10 s windowed max
+  delivery rate). While it is full the session loop does not tick the
+  pipeline at all, so the next frame carries everything that changed
+  meanwhile instead of stale frames queueing in socket buffers — including
+  behind one huge full-screen-change frame. A client silent for 4 s is
+  resynchronised with a keyframe.
+- `RateCtl` (every 100 ms) backs the encoder bitrate off toward the measured
+  delivery rate when acks show queueing, slow-starts ×1.5 and probes
+  gently near the last known capacity. Queue delay is measured CoDel-style:
+  the minimum send→ack delay over the last 200 ms above the 10 s minimum, so
+  one big frame does not read as congestion but a standing queue does.
+- Both turn on with the first ack. Clients that never ack (WebRTC media
+  tracks, older bundles) keep ping-based `AdaptiveBitrate` and
+  `CongestionTracker`. Windows service mode forwards keyframe needs to the
+  agent but cannot pause it, so the window is not enforced there.
+
+Same mechanism as voxl's; measured with `crates/server/examples/wan_bench.rs`
+(see `docs/benchmarks/`).
+
+### Keyframes
+
+Clients that never ack get an IDR every 2 seconds — their only way back from:
 - RTP loss / jitter spikes
 - Client decoder errors
 - Browser tab backgrounding/foregrounding
 - Client reconnect / resume
+
+Acking clients ask for what they need (`RequestKeyframe` on decoder error,
+tab focus, WSS recovery; resume; flow stall); requested keyframes bypass a
+full flow window, and periodic IDRs drop to a 30 s safety net. OpenH264's
+scene-change detection is off, so scrolling no longer emits I-frames.
 
 ### Session resume + replacement
 

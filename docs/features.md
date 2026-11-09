@@ -33,10 +33,11 @@ then CPU capture backends as needed.
 | Encoder | Codec | File | Notes |
 |---|---|---|---|
 | OpenH264 CPU | H.264 | `server/src/encode/h264.rs` | Baseline, always available |
-| NVENC | H.264 + AV1 | `gpu/src/nvenc.rs` | Runtime dlopen, no build-time CUDA dep |
-| NVENC fused with DXGI | H.264 + AV1 | `gpu/src/dxgi_nvenc.rs` | Zero-copy D3D11 texture → NVENC |
+| x264 CPU | H.264 | `server/src/encode/x264.rs` + `server/csrc/x264_shim.c` | Optional `--features x264` (GPL build); CRF + 1.25-frame VBV cap, UMH motion search, constrained baseline. Build libx264 with `scripts/build-x264.sh` |
+| NVENC | H.264 + AV1 | `gpu/src/nvenc.rs` | Runtime dlopen, no build-time CUDA dep; single-frame VBV |
+| NVENC fused with DXGI | H.264 + AV1 | `gpu/src/dxgi_nvenc.rs` | Zero-copy D3D11 texture → NVENC; single-frame VBV |
 
-`--codec auto` → H.264 (default for client compatibility). `--codec av1` opts into AV1 on Ada+ NVENC. Periodic keyframe every 2s; keyframe on client reconnect; keyframe on input burst.
+`--codec auto` → H.264 (default for client compatibility). `--codec av1` opts into AV1 on Ada+ NVENC. Keyframes: every 2s for clients that never ack video, a 30s safety net for acking clients (they request the rest); keyframe on client reconnect.
 
 ### AV1 status — opt-in, known decode problems
 
@@ -171,7 +172,7 @@ Structured fields via `tracing`; stdout + file if `--log-file` set.
 --transport <tcp,web,quic>             comma-separated; default tcp,web
 --fps <n>                              default 30
 --bitrate <kbps>                       default 5000; seeds ABR
---encoder <auto|openh264|nvenc>        default auto
+--encoder <auto|openh264|nvenc|x264>   default auto (x264: --features x264 builds)
 --codec <auto|h264|av1>                default auto (→ H.264)
 --capture <auto|scrap|nvfbc|pipewire|dxgi>
                                        default auto

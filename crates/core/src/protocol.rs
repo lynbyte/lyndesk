@@ -4,10 +4,13 @@ use crate::input::InputEvent;
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version. Bump when adding/changing Message variants.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Minimum protocol version we can interoperate with.
 /// Versions below this are rejected at handshake.
+///
+/// Kept at 6 in v10: `VideoAck` is client→server and the server only turns
+/// on flow control after receiving one, so older clients are unaffected.
 ///
 /// Kept at 6 in 0.5.9: `CursorUpdate` (the new v8 addition) is server→client,
 /// but the server only sends it after the client explicitly opts in with
@@ -235,6 +238,17 @@ pub enum Message {
         /// resize" flicker the user sees on every new tab.
         preferred_width: u32,
         preferred_height: u32,
+    },
+
+    /// Client → Server: cumulative ack — every `VideoFrame` up to and
+    /// including `sequence` has been decoded and painted (or deliberately
+    /// dropped). Drives the server's ack-based flow control
+    /// (`phantom_server::flow`). Added in protocol v10; servers enable flow
+    /// control only after the first ack, so clients that never send it keep
+    /// the old behaviour. Must stay the LAST variant: bincode encodes the
+    /// variant index.
+    VideoAck {
+        sequence: u64,
     },
 }
 
